@@ -15,3 +15,6 @@ env/
 
 # Project specific
 model_checkpoints/
+
+# macOS
+.DS_Store

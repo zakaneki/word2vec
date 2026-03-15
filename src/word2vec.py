@@ -16,12 +16,13 @@ class Word2VecSGNS:
         # Target/Center Word Embeddings (W_t)
         self.W_t = np.random.uniform(-scale, scale, (vocab_size, embedding_dim))
         
-        # Context Word Embeddings (W_c)
-        self.W_c = np.zeros((vocab_size, embedding_dim))
+        # Context Word Embeddings (W_c) — random init so both matrices
+        # receive non-zero gradients from the very first step.
+        self.W_c = np.random.uniform(-scale, scale, (vocab_size, embedding_dim))
 
     def _sigmoid(self, x):
-        # Clip to prevent overflow in exp
-        x = np.clip(x, -20.0, 20.0)
+        # Clip to prevent overflow in exp (exp(-30) ≈ 9.4e-14, safely representable)
+        x = np.clip(x, -30.0, 30.0)
         return 1.0 / (1.0 + np.exp(-x))
 
     def forward_backward_update(self, center_ids, pos_ids, neg_ids):
@@ -38,7 +39,7 @@ class Word2VecSGNS:
             loss: scalar representing the mini-batch objective loss
         """
         batch_size = center_ids.shape[0]
-        k = neg_ids.shape[1]
+        inv_batch = 1.0 / batch_size
         
         # 1. Lookup Embeddings
         # Shapes: (batch_size, embedding_dim)
@@ -49,25 +50,24 @@ class Word2VecSGNS:
         v_neg = self.W_c[neg_ids]        # negative context vectors
         
         # 2. Forward Pass (Dot Products + Sigmoid)
-        # Positive pair dot product
-        # Element-wise multiply then sum along embedding_dim -> (batch_size,)
-        score_pos = np.sum(u_w * v_c, axis=1)
-        prob_pos = self._sigmoid(score_pos)  # sigma(u_w * v_c)
+        # Positive pair: einsum 'ij,ij->i' contracts embedding_dim -> (batch_size,)
+        score_pos = np.einsum('ij,ij->i', u_w, v_c)
+        prob_pos = self._sigmoid(score_pos)         # sigma(u_w · v_c)
         
-        # Negative pairs dot product
-        # Broadcast u_w: (batch_size, 1, embedding_dim) 
-        # Element-wise multiply with v_neg, sum along embedding_dim -> (batch_size, k)
-        score_neg = np.sum(np.expand_dims(u_w, 1) * v_neg, axis=2)
-        prob_neg = self._sigmoid(score_neg)  # sigma(u_w * v_neg)
+        # Negative pairs: einsum 'ij,ikj->ik' contracts embedding_dim -> (batch_size, k)
+        score_neg = np.einsum('ij,ikj->ik', u_w, v_neg)
+        prob_neg = self._sigmoid(score_neg)          # sigma(u_w · v_neg)
         
-        # 3. Compute Loss (Negative likelihood of correct classes)
+        # 3. Compute Loss (Negative log-likelihood)
         # Loss = -log(prob_pos) - sum(log(1 - prob_neg))
-        # Note: 1 - sigma(x) = sigma(-x). We use 1 - prob_neg to avoid numerical instabilities if score_neg is large.
-        loss_pos = -np.sum(np.log(prob_pos + 1e-10))
-        loss_neg = -np.sum(np.log(1.0 - prob_neg + 1e-10))
-        total_loss = (loss_pos + loss_neg) / batch_size
+        loss_pos = -np.sum(np.log(prob_pos + 1e-7))
+        loss_neg = -np.sum(np.log(1.0 - prob_neg + 1e-7))
+        total_loss = (loss_pos + loss_neg) * inv_batch
         
-        # 4. Computed Gradients for local vectors
+        # 4. Compute Per-Sample Gradients (NOT normalized by batch_size)
+        # Word2vec uses per-sample SGD: each sample contributes its full
+        # gradient independently. The loss is averaged for display only.
+        #
         # dL/dv_c = (prob_pos - 1) * u_w  [Shape: (batch_size, embedding_dim)]
         grad_v_c = np.expand_dims(prob_pos - 1.0, 1) * u_w 
         
@@ -78,26 +78,13 @@ class Word2VecSGNS:
         
         # dL/du_w = (prob_pos - 1) * v_c + sum( prob_neg * v_neg ) [Shape: (batch_size, embedding_dim)]
         grad_u_w_pos = np.expand_dims(prob_pos - 1.0, 1) * v_c
-        grad_u_w_neg = np.sum(np.expand_dims(prob_neg, 2) * v_neg, axis=1) # (batch_size, embedding_dim)
+        grad_u_w_neg = np.sum(np.expand_dims(prob_neg, 2) * v_neg, axis=1)
         grad_u_w = grad_u_w_pos + grad_u_w_neg
         
-        # 5. SGD Updates (Apply Gradients locally to embedding matrices)
-        # Using simple SGD loop over batch is memory efficient and handles duplicate IDs correctly
-        # rather than complex scatter_add operations in pure numpy.
-        
-        for i in range(batch_size):
-            cw = center_ids[i]
-            pw = pos_ids[i]
-            nws = neg_ids[i]
-
-            # Update context embeddings
-            self.W_c[pw] -= self.lr * grad_v_c[i]
-            
-            # Update negative context embeddings
-            for j in range(k):
-                self.W_c[nws[j]] -= self.lr * grad_v_neg[i, j]
-                
-            # Update target word embedding
-            self.W_t[cw] -= self.lr * grad_u_w[i]
+        # 5. Vectorized SGD Updates
+        # np.add.at is unbuffered: duplicate indices accumulate correctly.
+        np.add.at(self.W_t, center_ids, -self.lr * grad_u_w)
+        np.add.at(self.W_c, pos_ids,    -self.lr * grad_v_c)
+        np.add.at(self.W_c, neg_ids,    -self.lr * grad_v_neg)
             
         return total_loss
